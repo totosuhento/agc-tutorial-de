@@ -1,0 +1,65 @@
+# Build image Docker otomatis setiap ada perubahan di branch main,
+# lalu simpan di GitHub Container Registry: ghcr.io/<username>/<nama-repo>:latest
+name: Build Docker image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: type=raw,value=latest
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+
+      # Uji cepat: jalankan image & pastikan halaman utama bisa dibuka
+      - name: Smoke test
+        run: |
+          IMAGE=$(echo "ghcr.io/${{ github.repository }}:latest" | tr '[:upper:]' '[:lower:]')
+          docker pull "$IMAGE"
+          check() {   # $1 = opsi docker run tambahan, $2 = daftar halaman, $3 = port (default 80)
+            P=${3:-8080}
+            docker rm -f agc >/dev/null 2>&1 || true
+            docker run -d --name agc -e CRON_ENABLED=0 -e SITE_URL=http://localhost $1 "$IMAGE" >/dev/null
+            for i in $(seq 1 30); do docker exec agc curl -s -o /dev/null http://localhost:$P/robots.txt && break; sleep 2; done
+            for p in $2; do
+              code=$(docker exec agc curl -s -o /dev/null -w '%{http_code}' "http://localhost:$P$p" || true)
+              echo "[$1] $p -> $code"
+              if [ "$code" != "200" ]; then
+                echo "::error title=Diag::id=$(docker exec agc id) | PORT=$(docker exec agc printenv PORT) | listen=$(docker exec agc grep -h Listen /etc/apache2/ports.conf | tr '\n' ' ') | cfg=$(docker image inspect "$IMAGE" -f '{{.Config.User}} {{.Config.ExposedPorts}} {{.Config.Env}}')"
+                echo "::error title=Smoke test::[$1] $p -> $code | ps: $(docker ps -a --format '{{.Status}} {{.Ports}}' | tr '\n' ' ') | logs: $(docker logs agc 2>&1 | tail -8 | tr '\n' ' ')"
+                exit 1
+              fi
+            done
+            code=$(docker exec agc curl -s -o /dev/null -w '%{http_code}' http://localhost:$P/video/tidak-ada || true)
+            echo "[$1] /video/tidak-ada -> $code"
+            [ "$code" = "404" ] || { echo "::error title=Smoke test::[$1] 404 page -> $code"; exit 1; }
+          }
+          check "" "/ /latest /series /privacy /impressum /robots.txt /sitemap.xml /assets/style.css"
+          check "-e SITE_LANG=en" "/ /latest /privacy /sitemap-pages-1.xml"
+          # Dijalankan sebagai root (hosting lain) & dengan PORT kustom
+          check "--user 0:0" "/ /privacy /robots.txt"
+          check "-e PORT=3000" "/ /robots.txt" 3000
